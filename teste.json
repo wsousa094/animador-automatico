@@ -1,6 +1,6 @@
 {
- "quando": "2026-11-26T01:34:38",
+ "quando": "2026-11-26T01:38:48",
  "google": "ok",
- "cloudflare": "erro: HTTP 403: {\"success\":false,\"errors\":[{\"code\":10000,\"message\":\"Authentication error\",\"documentation_url\":\"https://developers.cloudflare.com/api/resources/ai/subresources/models/methods/list\"}],\"messages\":[],\"result\":null}\n",
+ "cloudflare": "ok",
  "instagram": "faltando"
 }
