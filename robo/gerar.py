@@ -25,6 +25,18 @@ def env(k, padrao=''):
     return (os.environ.get(k) or padrao).strip()
 
 
+# Opções extras chegam grudadas no campo FINAL (o workflow do cliente não muda): "Pergunta pra comentar||leg=anton.amarelo"
+LEG = {'fonte': 'classica', 'cor': 'branco'}
+_fin = os.environ.get('FINAL', '')
+if '||' in _fin:
+    os.environ['FINAL'], _extra = _fin.split('||', 1)
+    for _kv in _extra.split(';'):
+        _k, _, _v = _kv.partition('=')
+        if _k.strip() == 'leg':
+            _f, _, _c = _v.strip().lower().partition('.')
+            LEG = {'fonte': _f or 'classica', 'cor': _c or 'branco'}
+
+
 def log(*a):
     print(*a, flush=True)
 
@@ -44,7 +56,7 @@ def modelos(tipo):
     global _MODELOS
     if _MODELOS is None:
         try:
-            bruto, _ = http(f'{GEM}?pageSize=300', cab={'x-goog-api-key': env('GEMINI_API_KEY')})
+            bruto, _ = http(f'{GEM}?pageSize=300', cab={'x-goog-api-key': env('GEMINI_API_KEY')}, timeout=30)
             _MODELOS = [m['name'].split('/')[-1] for m in json.loads(bruto).get('models', []) if 'generateContent' in m.get('supportedGenerationMethods', [])]
         except Exception as e:  # noqa: BLE001
             log('   não consegui listar os modelos:', e); _MODELOS = []
@@ -63,22 +75,38 @@ def gemini_texto(prompt):
     if IDIOMA == 'en':
         prompt += REGRA_EN
     corpo = {'contents': [{'parts': [{'text': prompt}]}], 'generationConfig': {'temperature': 1.0, 'responseMimeType': 'application/json'}}
-    ultimo = None
-    for modelo in dict.fromkeys(modelos('texto')):
-        for t in range(3):
+    if not env('GEMINI_API_KEY'):
+        raise RuntimeError('A chave da IA do Google não está no robô. Abra o app > Conta > Ligar o robô e cole a chave de novo.')
+    ultimo, cota, inicio = None, 0, time.time()
+    for modelo in list(dict.fromkeys(modelos('texto')))[:5]:
+        for t in range(2):
+            if time.time() - inicio > 420:   # no máximo 7 min nessa etapa
+                break
             try:
-                bruto, _ = http(f'{GEM}/{modelo}:generateContent', corpo, {'Content-Type': 'application/json', 'x-goog-api-key': env('GEMINI_API_KEY')})
+                bruto, _ = http(f'{GEM}/{modelo}:generateContent', corpo, {'Content-Type': 'application/json', 'x-goog-api-key': env('GEMINI_API_KEY')}, timeout=90)
                 d = json.loads(bruto)
                 return json.loads(''.join(p.get('text', '') for p in d['candidates'][0]['content']['parts']))
             except urllib.error.HTTPError as e:
-                ultimo = f'{modelo}: HTTP {e.code} {e.read().decode(errors="replace")[:200]}'
+                txt = e.read().decode(errors='replace')
+                ultimo = f'{modelo}: HTTP {e.code} {txt[:200]}'
                 log('  ', ultimo)
-                if e.code in (429, 500, 503):
-                    time.sleep(20 * (t + 1)); continue
+                if e.code in (400, 401, 403) and re.search(r'API.?key|PERMISSION|invalid', txt, re.I):
+                    raise RuntimeError('A chave da IA do Google foi recusada. Crie uma chave nova no Google AI Studio e cole no app (Conta > Ligar o robô).')
+                if e.code == 429:
+                    cota += 1
+                    break   # cota desse modelo acabou: tenta o próximo sem esperar
+                if e.code in (500, 503):
+                    time.sleep(8 * (t + 1)); continue
                 break
             except Exception as e:  # noqa: BLE001
-                ultimo = f'{modelo}: {e}'; log('  ', ultimo); time.sleep(5)
-    raise RuntimeError('Não consegui falar com a IA do Google. ' + str(ultimo))
+                ultimo = f'{modelo}: {e}'; log('  ', ultimo); time.sleep(3)
+        else:
+            continue
+        if time.time() - inicio > 420:
+            break
+    if cota:
+        raise RuntimeError('A cota grátis da IA do Google acabou por hoje nessa chave. Tente de novo mais tarde (ela renova todo dia) ou crie outra chave no Google AI Studio.')
+    raise RuntimeError('A IA do Google não respondeu agora (instabilidade do Google). Espere uns minutos e toque em Criar vídeo de novo.')
 
 
 ESTILOS = {
@@ -248,10 +276,12 @@ Regras:
 - A cena 1 é o GANCHO: em uma frase, o conflito e o que está em jogo. Nada de "olá" ou apresentação.
 - Cada cena traz uma escalada ou virada. {FINAIS.get(env('FINAL'), FINAIS['Pergunta pra comentar'])}
 - Personagens fictícios. Nada de pessoas reais, marcas reais, violência gráfica ou conteúdo adulto.
-- Para cada cena, "imagem": descrição VISUAL em inglês da cena (quem aparece, expressão, ação, lugar, enquadramento), sem texto escrito na imagem.
-- "personagem": descrição visual fixa, em inglês, do protagonista (idade, cabelo, roupa, traços), pra manter igual em todas as cenas.
+- Para cada cena, "imagem": descrição VISUAL em inglês da cena (quem aparece, expressão, ação, enquadramento), sem texto escrito na imagem. Chame cada personagem SEMPRE pelo mesmo nome do "elenco" (ex.: "Lucas", "Mia"); nunca escreva "he/she/the girl" sozinho. O protagonista aparece no máximo uma vez por imagem.
+- "personagem": descrição visual fixa, em inglês, do protagonista (nome, idade, cabelo, roupa, traços), pra manter igual em todas as cenas.
+- "elenco": os OUTROS personagens que aparecem (no máximo 3), cada um com "nome" e "visual" (descrição fixa em inglês: idade, cabelo, roupa, traços). Pode ser lista vazia.
+- "cenario": o lugar principal da história, descrito em inglês com detalhes fixos (tipo de lugar, cores, luz, objetos marcantes), pra todas as cenas parecerem no mesmo lugar. Se uma cena acontecer em outro lugar, diga o lugar dentro do "imagem".
 - "legenda": legenda do post em português com 2 a 3 frases curtas, um emoji, uma chamada pra comentar e 4 hashtags.
-Responda só em JSON: {{"titulo": str, "personagem": str, "cenas": [{{"fala": str, "imagem": str, "destaque": str}}], "legenda": str}}
+Responda só em JSON: {{"titulo": str, "personagem": str, "elenco": [{{"nome": str, "visual": str}}], "cenario": str, "cenas": [{{"fala": str, "imagem": str, "destaque": str}}], "legenda": str}}
 ("destaque" é a palavra mais forte da fala)."""
     h = gemini_texto(prompt)
     h['cenas'] = h['cenas'][:n]
@@ -276,7 +306,11 @@ def _ref(caminho):
     b = io.BytesIO(); im.save(b, 'PNG'); return b.getvalue()
 
 
-def cf_imagem(prompt, w, h, refs=(), seed=None):
+class ImagemRecusada(RuntimeError):
+    pass
+
+
+def _cf_chamar(prompt, w, h, refs, seed):
     conta, token = env('CF_ACCOUNT_ID'), env('CF_API_TOKEN')
     campos = {'prompt': prompt, 'width': w, 'height': h}
     if seed is not None:
@@ -289,7 +323,7 @@ def cf_imagem(prompt, w, h, refs=(), seed=None):
             if 'json' in ct:
                 img = (json.loads(bruto).get('result') or {}).get('image')
                 if not img:
-                    raise RuntimeError('resposta sem imagem')
+                    raise ImagemRecusada('resposta sem imagem')
                 return base64.b64decode(img)
             return bruto
         except urllib.error.HTTPError as e:
@@ -299,9 +333,35 @@ def cf_imagem(prompt, w, h, refs=(), seed=None):
                 raise RuntimeError('A cota grátis de imagens de hoje acabou. Ela renova às 21h (horário de Brasília).')
             if e.code in (401, 403):
                 raise RuntimeError('O token da Cloudflare foi recusado. Refaça o passo 2 da ativação.')
+            if e.code in (400, 413, 422):
+                raise ImagemRecusada(f'HTTP {e.code} {msg[:120]}')   # pedido recusado: não adianta repetir igual
             if t < 2:
                 time.sleep(15 * (t + 1)); continue
-            raise RuntimeError(f'Cloudflare respondeu HTTP {e.code}')
+            raise RuntimeError(f'O gerador de imagens da Cloudflare está instável agora (HTTP {e.code}). Tente de novo em alguns minutos.')
+        except (urllib.error.URLError, TimeoutError) as e:
+            if t < 2:
+                time.sleep(10); continue
+            raise RuntimeError(f'O gerador de imagens da Cloudflare não respondeu ({e}). Tente de novo em alguns minutos.')
+
+
+def _simplificar(prompt):
+    """Prompt mais curto e neutro (o gerador recusa pedido longo demais ou com palavra sensível)."""
+    p = re.sub(r'\s+', ' ', prompt)
+    p = re.sub(r'(?i)\b(blood\w*|gun\w*|weapon\w*|knife|kill\w*|dead|death|naked|nude|sexy|drunk|drugs?|beer|alcohol|cigarett\w*|violen\w*|fight\w*|punch\w*)\b', '', p)
+    return p[:700]
+
+
+def cf_imagem(prompt, w, h, refs=(), seed=None):
+    """Gera a imagem. Se a Cloudflare recusar (HTTP 400), tenta de novo com prompt menor, sem referência e outra seed."""
+    tentativas = [(prompt, refs, seed), (_simplificar(prompt), refs, seed), (_simplificar(prompt), (), (seed or 0) + 7777),
+                  (_simplificar(prompt)[:350], (), (seed or 0) + 31)]
+    ultimo = None
+    for n, (p, r, sd) in enumerate(tentativas):
+        try:
+            return _cf_chamar(p, w, h, r, sd)
+        except ImagemRecusada as e:
+            ultimo = e; log(f'   imagem recusada (tentativa {n + 1}), ajustando o pedido: {e}')
+    raise ImagemRecusada(f'o gerador recusou essa imagem ({ultimo})')
 
 
 PASTA_3D = RAIZ / 'r3d'
@@ -318,7 +378,7 @@ def preparar_3d():
     for arq in ('cena3d.html', 'cena3d.js'):
         shutil.copy(RAIZ / 'robo' / arq, PASTA_3D / arq)
     shutil.copy(PASTA_3D / 'node_modules' / 'three' / 'build' / 'three.min.js', PASTA_3D / 'three.min.js')
-    if _fonte().startswith('Montserrat'):
+    if _fonte() != 'DejaVu Sans':
         shutil.copy(RAIZ / 'robo' / 'Montserrat-ExtraBold.ttf', PASTA_3D / 'Montserrat-ExtraBold.ttf')
     for t in ('earth_atmos_2048.jpg', 'earth_specular_2048.jpg', 'earth_normal_2048.jpg', 'earth_clouds_1024.png', 'moon_1024.jpg'):
         if not (PASTA_3D / 'tex' / t).exists():
@@ -329,6 +389,18 @@ def preparar_3d():
     log('motor 3D pronto')
 
 
+def prompt_cena(h, c, arte):
+    """Prompt de uma cena com continuidade: mesmo cenário, mesmo protagonista e os outros personagens sempre iguais."""
+    cena = c.get('imagem', '')
+    outros = [e for e in (h.get('elenco') or []) if isinstance(e, dict) and e.get('nome') and e.get('nome', '').lower() in cena.lower()]
+    partes = [f"{arte}. Vertical 9:16 frame. Scene: {cena}.", "Full detailed background environment (never a plain or studio background).",
+              f"Setting: {h['cenario']}." if h.get('cenario') else '',
+              f"Main character, appears only ONCE in the image, looks exactly like the reference image (use the reference only for the character, not for the background): {h['personagem']}.",
+              ' '.join(f"{e['nome']}: {e.get('visual', '')}." for e in outros),
+              "Each character appears only once, no duplicates, no clones. No text, no letters, no watermark."]
+    return ' '.join(x for x in partes if x)
+
+
 def imagens():
     h = json.loads((SAIDA / 'historia.json').read_text(encoding='utf-8'))
     if env('ESTILO') in ESTILOS_3D:
@@ -337,12 +409,28 @@ def imagens():
     arte = ARTES.get(env('ARTE', 'Cartoon 2D'), ARTES['Cartoon 2D'])
     seed = sum(map(ord, h['titulo'])) % 100000
     ref = SAIDA / 'personagem.png'
-    ref.write_bytes(cf_imagem(f"{arte}. Character reference, single character, full body, neutral pose, plain light background. {h['personagem']}", 768, 768, seed=seed))
-    log('personagem ok')
+    try:
+        ref.write_bytes(cf_imagem(f"{arte}. Character reference, single character, full body, neutral pose, plain light background. {h['personagem']}", 768, 768, seed=seed))
+        refs = [ref]
+        log('personagem ok')
+    except ImagemRecusada as e:
+        refs = []; log('   personagem recusado, sigo sem referência:', e)
+    feitas = []
     for i, c in enumerate(h['cenas']):
-        p = f"{arte}. Vertical 9:16 frame. Main character (exactly as in the reference image, same face, same hair, same clothes and colors in every scene): {h['personagem']}. Scene: {c['imagem']}. No text, no letters, no watermark."
-        (SAIDA / f'cena_{i:02d}.png').write_bytes(cf_imagem(p, 720, 1280, refs=[ref], seed=seed + i + 1))
-        log(f'cena {i + 1}/{len(h["cenas"])} ok')
+        p = prompt_cena(h, c, arte)
+        destino = SAIDA / f'cena_{i:02d}.png'
+        try:
+            destino.write_bytes(cf_imagem(p, 720, 1280, refs=refs, seed=seed + i + 1))
+            feitas.append(destino); log(f'cena {i + 1}/{len(h["cenas"])} ok')
+        except ImagemRecusada as e:
+            log(f'   cena {i + 1} recusada, vou reaproveitar outra cena:', e)
+    if not feitas:
+        raise RuntimeError('O gerador de imagens recusou todas as cenas dessa história. Tente outro tema ou mude o estilo do desenho.')
+    for i in range(len(h['cenas'])):   # cena recusada usa a cena anterior (ou a seguinte) pro vídeo sair inteiro
+        destino = SAIDA / f'cena_{i:02d}.png'
+        if not destino.exists():
+            antes = [f for f in feitas if int(f.stem[-2:]) < i]
+            destino.write_bytes((antes[-1] if antes else feitas[0]).read_bytes())
 
 
 VOZES = {'Masculina': 'Puck', 'Feminina': 'Kore', 'Grave de suspense': 'Charon', 'Jovem animada': 'Leda'}
@@ -409,15 +497,49 @@ def voz():
     log(f'narração {total:.1f}s')
 
 
+FONTSOURCE = 'https://cdn.jsdelivr.net/fontsource/fonts/'
+GFONTS = 'https://raw.githubusercontent.com/google/fonts/main/'
+# nome no app -> (arquivo fontsource, arquivo google fonts, tamanho da legenda)
+FONTES_LEG = {'classica': ('montserrat@latest/latin-800-normal.ttf', '', 78),
+              'impacto': ('anton@latest/latin-400-normal.ttf', 'ofl/anton/Anton-Regular.ttf', 92),
+              'alta': ('bebas-neue@latest/latin-400-normal.ttf', 'ofl/bebasneue/BebasNeue-Regular.ttf', 100),
+              'redonda': ('poppins@latest/latin-700-normal.ttf', 'ofl/poppins/Poppins-Bold.ttf', 74),
+              'gibi': ('bangers@latest/latin-400-normal.ttf', 'ofl/bangers/Bangers-Regular.ttf', 96),
+              'divertida': ('luckiest-guy@latest/latin-400-normal.ttf', 'apache/luckiestguy/LuckiestGuy-Regular.ttf', 72)}
+# cor -> (cor do texto, cor da palavra em destaque) no formato do ASS (&HBBGGRR)
+CORES_LEG = {'branco': ('&H00FFFFFF', '&H3FD2FF'), 'amarelo': ('&H003FD2FF', '&HFFFFFF'), 'verde': ('&H006AFF39', '&HFFFFFF'),
+             'rosa': ('&H00D84FFF', '&HFFFFFF'), 'azul': ('&H00FFC34F', '&HFFFFFF'), 'laranja': ('&H001F8AFF', '&HFFFFFF')}
+PASTA_FONTES = SAIDA / 'fontes'
+
+
+def _baixar_fonte(chave):
+    """Baixa a fonte pra saida/fontes e devolve o nome da família (o que o ASS usa)."""
+    fs, gf, _ = FONTES_LEG.get(chave, FONTES_LEG['classica'])
+    PASTA_FONTES.mkdir(exist_ok=True)
+    arq = PASTA_FONTES / f'{chave}.ttf'
+    if not arq.exists():
+        for url in ([FONTSOURCE + fs] if fs else []) + ([GFONTS + gf] if gf else []):
+            try:
+                arq.write_bytes(http(url, timeout=60)[0]); break
+            except Exception as e:  # noqa: BLE001
+                log('   fonte', chave, 'falhou:', e)
+    if not arq.exists():
+        return None
+    try:
+        from PIL import ImageFont
+        fam, est = ImageFont.truetype(str(arq)).getname()
+        return fam if est in ('Regular', 'Normal', 'Book') else f'{fam} {est}'   # nome completo: o libass acha o peso certo
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _fonte():
+    """Fonte padrão (Montserrat ExtraBold), usada também pelos textos das cenas 3D."""
+    nome = _baixar_fonte('classica')
     f = RAIZ / 'robo' / 'Montserrat-ExtraBold.ttf'
-    if not f.exists():
-        try:
-            bruto, _ = http('https://github.com/google/fonts/raw/main/ofl/montserrat/static/Montserrat-ExtraBold.ttf', timeout=60)
-            f.write_bytes(bruto)
-        except Exception:  # noqa: BLE001
-            return 'DejaVu Sans'
-    return 'Montserrat ExtraBold'
+    if nome and not f.exists():
+        f.write_bytes((PASTA_FONTES / 'classica.ttf').read_bytes())
+    return nome or 'DejaVu Sans'
 
 
 def _t(s):
@@ -425,12 +547,25 @@ def _t(s):
     return f'{int(h)}:{int(m):02d}:{s2:05.2f}'
 
 
+def estilo_leg(fonte):
+    """Fonte, tamanho e cores escolhidos no app (vale pra legenda e pro título das perguntas 3D)."""
+    chave = LEG['fonte'] if LEG['fonte'] in FONTES_LEG else 'classica'
+    nome_leg = fonte if chave == 'classica' else (_baixar_fonte(chave) or fonte)
+    tam = FONTES_LEG[chave][2] if nome_leg != 'DejaVu Sans' else 74
+    cor, cor_dest = CORES_LEG.get(LEG['cor'], CORES_LEG['branco'])
+    return nome_leg, tam, cor, cor_dest
+
+
 def legendas(tempos, fonte, arq):
+    """Legenda da fala. Fonte e cor vêm da escolha no app (LEG); 'sem' = vídeo sem legenda."""
+    nome_leg, tam, cor, cor_dest = estilo_leg(fonte)
+    negrito = -1 if nome_leg == 'DejaVu Sans' else 0
     linhas = ['[Script Info]', 'ScriptType: v4.00+', 'PlayResX: 1080', 'PlayResY: 1920', '',
               '[V4+ Styles]', 'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
-              f'Style: L,{fonte},78,&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,7,3,2,70,70,520,1', '',
+              f'Style: L,{nome_leg},{tam},{cor},{cor},&H00000000,&H64000000,{negrito},0,0,0,100,100,1,0,1,7,3,2,70,70,520,1', '',
               '[Events]', 'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text']
-    for t in tempos:
+    volta = '&H' + cor[4:]
+    for t in ([] if LEG['fonte'] == 'sem' else tempos):
         palavras = t['fala'].split()
         blocos = [palavras[i:i + 3] for i in range(0, len(palavras), 3)]
         dur = max(0.5, (t['fim'] - 0.4) - t['ini'])
@@ -439,7 +574,7 @@ def legendas(tempos, fonte, arq):
         ac = t['ini']
         for b, p in zip(blocos, pesos):
             d = dur * p / sum(pesos)
-            txt = ' '.join(('{\\c&H3FD2FF&}' + w + '{\\c&HFFFFFF&}') if dest and w.strip('.,!?…').lower() == dest else w for w in b)
+            txt = ' '.join(('{\\c' + cor_dest + '&}' + w + '{\\c' + volta + '&}') if dest and w.strip('.,!?…').lower() == dest else w for w in b)
             linhas.append(f'Dialogue: 0,{_t(ac)},{_t(ac + d)},L,,0,0,0,,{{\\fscx85\\fscy85\\t(0,90,\\fscx100\\fscy100)}}{txt}')
             ac += d
     arq.write_text('\n'.join(linhas) + '\n', encoding='utf-8')
@@ -483,13 +618,15 @@ def montar():
         perg = json.loads((SAIDA / 'historia.json').read_text(encoding='utf-8')).get('pergunta') if env('ESTILO') in ('explica3d', 'ese3d', 'historia3d') else ''
     except Exception:  # noqa: BLE001
         perg = ''
-    if perg:
+    if perg and LEG['fonte'] != 'sem':   # o título segue a escolha da legenda (sem legenda = sem título)
         ass = (SAIDA / 'leg.ass').read_text(encoding='utf-8')
-        estilo_t = f'Style: T,{fonte},76,&H00111111,&H00111111,&H00FFFFFF,&H00FFFFFF,-1,0,0,0,100,100,0,0,3,22,0,8,80,80,190,1'
+        nome_t, tam_t, cor_t, _ = estilo_leg(fonte)
+        neg_t = -1 if nome_t == 'DejaVu Sans' else 0
+        estilo_t = f'Style: T,{nome_t},{round(tam_t * 76 / 78)},&H00111111,&H00111111,{cor_t},{cor_t},{neg_t},0,0,0,100,100,0,0,3,22,0,8,80,80,190,1'
         ass = ass.replace('\n\n[Events]', '\n' + estilo_t + '\n\n[Events]', 1)
         ass += f'Dialogue: 1,{_t(0)},{_t(tempos[-1]["fim"] + 1)},T,,0,0,0,,{perg.replace(chr(10), " ")}\n'
         (SAIDA / 'leg.ass').write_text(ass, encoding='utf-8')
-    fontes = f":fontsdir={RAIZ / 'robo'}" if fonte.startswith('Montserrat') else ''
+    fontes = f":fontsdir={PASTA_FONTES}" if PASTA_FONTES.exists() else ''
     vf = (';'.join(filtro) + f';[{ultimo}]' if filtro else '[0:v]') + f"ass={SAIDA / 'leg.ass'}{fontes}[vf]"
     subprocess.run(['ffmpeg', '-y', '-v', 'error', *entradas, '-i', str(SAIDA / 'voz.mp3'), '-filter_complex', vf,
                     '-map', '[vf]', '-map', f'{len(partes)}:a', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-pix_fmt', 'yuv420p',
