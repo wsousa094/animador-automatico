@@ -1,5 +1,12 @@
 [
  {
+  "id": "v20261128015249",
+  "titulo": "A Corrida dos Dados",
+  "estilo": "decide",
+  "criado": "2026-11-28T02:01:29",
+  "status": "previa"
+ },
+ {
   "id": "v20261127191313",
   "titulo": "O Segredo dos Elevadores",
   "estilo": "explica3d",
